@@ -1,0 +1,300 @@
+# ============================================================
+# SRA 数据初处理
+# ============================================================
+
+library(ShortRead)
+
+# ---------- 设置文件路径 ----------
+fastq_R1 <- "D:/下载专用/SRR23825476_1.fastq.gz"
+fastq_R2 <- "D:/下载专用/SRR23825476_2.fastq.gz"
+output_R1 <- "filtered_R1.fastq.gz"
+output_R2 <- "filtered_R2.fastq.gz"
+chunk_size <- 1e6
+
+# ---------- 初始化流式读取器 ----------
+stream_R1 <- FastqStreamer(fastq_R1, n = chunk_size)
+stream_R2 <- FastqStreamer(fastq_R2, n = chunk_size)
+
+# ---------- 清空并创建输出文件 ----------
+writeFastq(ShortReadQ(), output_R1, compress = TRUE, mode = "w")
+writeFastq(ShortReadQ(), output_R2, compress = TRUE, mode = "w")
+
+# ---------- 分批处理 ----------
+tryCatch({
+    processed_batches <- 0
+    total_retained <- 0
+    error_count <- 0
+    max_errors <- 10  # 最大允许错误次数，避免无限循环
+
+    while (TRUE) {
+        processed_batches <- processed_batches + 1
+
+        # 安全地读取批次
+        chunk_R1 <- tryCatch({
+            yield(stream_R1)
+        }, error = function(e) {
+            error_count <<- error_count + 1
+            message(sprintf("批次 %d: 读取R1时出错 (错误%d/%d): %s",
+                           processed_batches, error_count, max_errors, e$message))
+
+            if (error_count >= max_errors) {
+                message("达到最大错误次数，停止处理")
+                return(ShortReadQ())
+            }
+
+            message("尝试跳过当前批次继续处理...")
+            return(NULL)
+        })
+
+        # 如果读取R1出错返回NULL，跳过整个批次
+        if (is.null(chunk_R1)) {
+            tryCatch({
+                yield(stream_R2)  # 读取但不使用，保持指针同步
+            }, error = function(e) {
+                message("跳过R2同步读取时出错: ", e$message)
+            })
+            next
+        }
+
+        chunk_R2 <- tryCatch({
+            yield(stream_R2)
+        }, error = function(e) {
+            error_count <<- error_count + 1
+            message(sprintf("批次 %d: 读取R2时出错 (错误%d/%d): %s",
+                           processed_batches, error_count, max_errors, e$message))
+
+            if (error_count >= max_errors) {
+                message("达到最大错误次数，停止处理")
+                return(ShortReadQ())
+            }
+
+            message("尝试跳过当前批次继续处理...")
+            return(NULL)
+        })
+
+        if (is.null(chunk_R2)) {
+            next
+        }
+
+        # 如果任一文件读完则退出
+        if (length(chunk_R1) == 0 | length(chunk_R2) == 0) {
+            cat(sprintf("文件读取完成，已处理 %d 个批次\n", processed_batches))
+            break
+        }
+
+        # 重置错误计数
+        error_count <- 0
+
+        # 检查两个chunk大小是否一致
+        if (length(chunk_R1) != length(chunk_R2)) {
+            warning(sprintf("批次 %d: R1和R2读取数量不一致 (%d vs %d)",
+                           processed_batches, length(chunk_R1), length(chunk_R2)))
+
+            min_length <- min(length(chunk_R1), length(chunk_R2))
+            if (min_length > 0) {
+                chunk_R1 <- chunk_R1[1:min_length]
+                chunk_R2 <- chunk_R2[1:min_length]
+                message(sprintf("调整到最小长度: %d 对序列", min_length))
+            } else {
+                warning("没有可处理的序列，跳过批次")
+                next
+            }
+        }
+
+        # ---------- 步骤1: 检查ID匹配 ----------
+        id_R1 <- sub("/[12]$", "", as.character(ShortRead::id(chunk_R1)))
+        id_R2 <- sub("/[12]$", "", as.character(ShortRead::id(chunk_R2)))
+
+        if (!all(id_R1 == id_R2)) {
+            warning(sprintf("批次 %d: 存在ID不匹配的序列 (%d 对序列)",
+                           processed_batches, length(chunk_R1)))
+
+            matching_indices <- which(id_R1 == id_R2)
+
+            if (length(matching_indices) > 0) {
+                chunk_R1 <- chunk_R1[matching_indices]
+                chunk_R2 <- chunk_R2[matching_indices]
+                id_R1 <- id_R1[matching_indices]
+                id_R2 <- id_R2[matching_indices]
+                message(sprintf("保留 %d 对匹配的序列", length(matching_indices)))
+            } else {
+                warning("没有匹配的ID，跳过整个批次")
+                next
+            }
+        }
+
+        # ---------- 步骤2: 质量过滤 ----------
+        qual_cutoff <- 20
+        bad_base_ratio <- 0.4
+
+        process_quality <- function(chunk) {
+            tryCatch({
+                qual <- quality(chunk)
+                if (length(chunk) == 0) {
+                    return(matrix(nrow = 0, ncol = 0))
+                }
+                qual_matrix <- as(qual, "matrix")
+                qual_matrix[is.na(qual_matrix)] <- 0
+                return(qual_matrix)
+            }, error = function(e) {
+                warning("质量值处理错误: ", e$message)
+                n_reads <- length(chunk)
+                n_bases <- ifelse(n_reads > 0, max(width(chunk)), 1)
+                return(matrix(0, nrow = n_reads, ncol = n_bases))
+            })
+        }
+
+        qual_R1 <- process_quality(chunk_R1)
+        qual_R2 <- process_quality(chunk_R2)
+
+        bad_R1 <- rowSums(qual_R1 < qual_cutoff, na.rm = TRUE) / pmax(width(chunk_R1), 1)
+        bad_R2 <- rowSums(qual_R2 < qual_cutoff, na.rm = TRUE) / pmax(width(chunk_R2), 1)
+
+        bad_R1[is.na(bad_R1)] <- 1
+        bad_R2[is.na(bad_R2)] <- 1
+
+        good_reads <- (bad_R1 < bad_base_ratio) & (bad_R2 < bad_base_ratio)
+        good_reads[is.na(good_reads)] <- FALSE
+
+        filtered_R1 <- chunk_R1[good_reads]
+        filtered_R2 <- chunk_R2[good_reads]
+
+        total_retained <- total_retained + length(filtered_R1)
+
+        # ---------- 步骤3: 写入输出 ----------
+        if (length(filtered_R1) > 0) {
+            tryCatch({
+                writeFastq(filtered_R1, output_R1, compress = TRUE, mode = "a")
+                writeFastq(filtered_R2, output_R2, compress = TRUE, mode = "a")
+            }, error = function(e) {
+                warning("写入错误: ", e$message)
+            })
+        }
+
+        retention_rate <- ifelse(length(chunk_R1) > 0,
+                                length(filtered_R1) / length(chunk_R1) * 100, 0)
+        cat(sprintf("批次 %d: 处理 %d对 | 保留 %d对 (%.1f%%) | 总计保留: %d\n",
+                   processed_batches, length(chunk_R1), length(filtered_R1),
+                   retention_rate, total_retained))
+
+        if (processed_batches %% 10 == 0) {
+            flush.console()
+        }
+    }
+}, error = function(e) {
+    cat(sprintf("主循环出错: %s\n", e$message))
+}, finally = {
+    try(close(stream_R1), silent = TRUE)
+    try(close(stream_R2), silent = TRUE)
+    cat(sprintf("处理完成。总共处理 %d 个批次，保留 %d 对序列\n",
+                processed_batches, total_retained))
+    cat(sprintf("遇到 %d 个错误批次\n", error_count))
+})
+
+
+# ============================================================
+# 提取参考序列，构建索引
+# ============================================================
+# BiocManager::install("Rsubread")
+library(Rsubread)
+
+buildindex(
+    basename  = "my_index",
+    reference = "D:/生信文件/生信原始数据/大豆ncbi_dataset/data/GCA_000004515.5/GCA_000004515.5_Glycine_max_v4.0_genomic.fna",
+    memory    = 8000
+)
+
+# 移动到可读取的目录中
+dir.create("C:/Temp/soy_index", recursive = TRUE, showWarnings = FALSE)
+source_files <- list.files("D:/my_index", full.names = TRUE)
+file.copy(
+    from      = source_files,
+    to        = "C:/Temp/soy_index/",
+    overwrite = TRUE
+)
+
+# 删除文件名中的空格
+file.rename(
+    "C:/Users/mc200209090406/Desktop/SRR23825475_R1.fastq .gz",
+    "C:/Users/mc200209090406/Desktop/SRR23825475_R1.fastq.gz"
+)
+file.rename(
+    "C:/Users/mc200209090406/Desktop/SRR23825475_R2.fastq .gz",
+    "C:/Users/mc200209090406/Desktop/SRR23825475_R2.fastq.gz"
+)
+
+
+# ============================================================
+# 比对
+# ============================================================
+library(Rsubread)
+
+align(
+    index       = "C:/Temp/soy_index/my_index",
+    readfile1   = "C:/Users/mc200209090406/Desktop/SRR23825475_R1.fastq.gz",
+    readfile2   = "C:/Users/mc200209090406/Desktop/SRR23825475_R2.fastq.gz",
+    output_file = "soybean_aligned.bam",
+    phredOffset = 64,
+    nthreads    = 4
+)
+
+# 检查比对结果
+if (file.exists("soybean_aligned.bam")) {
+    cat("比对成功完成！输出文件：soybean_aligned.bam\n")
+} else {
+    stop("比对失败，请检查错误日志。")
+}
+
+
+# ============================================================
+# 比对结果统计
+# ============================================================
+library(Rsubread)
+bam_stats <- propmapped("soybean_aligned.bam")
+
+library(Rsamtools)
+# 不在 BAM 中需要指定路径
+bam_file <- "D:/下载专用/PRJNA1191165/soybean_aligned.bam"
+bam_flags <- scanBam(bam_file, param = ScanBamParam(what = "flag"))[[1]]$flag
+total_reads  <- length(bam_flags)
+mapped_reads <- sum(!bam_flags %in% c(4, 77, 141, 2052, 2068))  # 排除未比对标志
+mapping_rate <- mapped_reads / total_reads * 100
+
+cat(sprintf("总比对率: %.2f%%\n", bam_stats$percent_mapped * 100))
+cat(sprintf("唯一比对: %.2f%%\n", bam_stats$percent_unique * 100))
+cat(sprintf("多重比对: %.2f%%\n", bam_stats$percent_multimapping * 100))
+
+
+# ============================================================
+# 外显子水平（exon-level）计数
+# ============================================================
+counts <- featureCounts(
+    files               = "soybean_aligned.bam",
+    annot.ext           = "D:/生信文件/生信原始数据/大豆ncbi_dataset/data/GCA_000004515.5/genomic.gff",
+    isGTFAnnotationFile = TRUE,
+    GTF.featureType     = "exon",
+    GTF.attrType        = "ID",
+    GTF.attrType.extra  = c("Parent", "Name"),
+    allowMultiOverlap   = TRUE,
+    isPairedEnd         = TRUE,
+    nthreads            = 4
+)
+
+# 保存外显子文件
+write.csv(counts$counts, "soybean_gene_counts.csv")
+
+# 将 counts 对象转换为数据框
+exon_counts <- as.data.frame(counts$counts)
+exon_counts$exon_id <- rownames(exon_counts)
+colnames(exon_counts)[1] <- "count"
+exon_counts$gene_id <- gsub("exon-gnl\\|doejgi\\|([^.]+\\.[^.-]+).*", "\\1", exon_counts$exon_id)
+
+# 按基因汇总计数
+library(dplyr)
+gene_counts <- exon_counts %>%
+    group_by(gene_id) %>%
+    summarise(expression_count = sum(count)) %>%
+    arrange(desc(expression_count))
+
+# 保存基因水平计数
+write.csv(gene_counts, "soybean_gene_counts.csv", row.names = FALSE)
